@@ -1,0 +1,41 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+knowledge_base/raw/external/*.md
+knowledge_base/raw/external/manifest.json
+knowledge_base/raw/blessing/generated/
+knowledge_base/processed/
+
+# Local databases and generated artifacts
+data/chroma/
+*.sqlite3
+*.db
+
+# Python environments and tooling
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets
+.env.*
+!.env.example
+
+# Temporary files
+*.log
+.DS_Store
+
+# Chroma databases and backups
+data/chroma*/
+data/*chroma*backup*/
+
+# Temporary source backups
+*.bak
+*.backup
+*.before-*
+*.broken-backup
+
+# Timestamped and named backup files
+*.bak-*
+*.backup-*

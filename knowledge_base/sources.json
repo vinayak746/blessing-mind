@@ -1,0 +1,123 @@
+[
+  {
+    "id": "discord-webhooks",
+    "title": "Discord Webhooks",
+    "service": "discord",
+    "url": "https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks",
+    "allowed_domains": [
+      "support.discord.com"
+    ],
+    "max_pages": 5,
+    "enabled": true
+  },
+  {
+    "id": "slack-webhooks",
+    "title": "Slack Incoming Webhooks",
+    "service": "slack",
+    "url": "https://api.slack.com/messaging/webhooks",
+    "allowed_domains": [
+      "api.slack.com"
+    ],
+    "max_pages": 5,
+    "enabled": true
+  },
+  {
+    "id": "whatsapp-cloud-api",
+    "title": "WhatsApp Cloud API",
+    "service": "whatsapp",
+    "url": "https://developers.facebook.com/docs/whatsapp/cloud-api/",
+    "allowed_domains": [
+      "developers.facebook.com"
+    ],
+    "max_pages": 5,
+    "enabled": true
+  },
+  {
+    "id": "stripe-webhooks",
+    "title": "Stripe Webhooks",
+    "service": "stripe",
+    "url": "https://docs.stripe.com/webhooks",
+    "allowed_domains": [
+      "docs.stripe.com"
+    ],
+    "max_pages": 5,
+    "enabled": true
+  },
+  {
+    "id": "google-apps-script",
+    "title": "Google Apps Script",
+    "service": "google-forms",
+    "url": "https://developers.google.com/apps-script",
+    "allowed_domains": [
+      "developers.google.com"
+    ],
+    "max_pages": 5,
+    "enabled": true
+  },
+  {
+    "id": "gemini-api",
+    "title": "Gemini API",
+    "service": "gemini",
+    "url": "https://ai.google.dev/gemini-api/docs",
+    "allowed_domains": [
+      "ai.google.dev"
+    ],
+    "max_pages": 5,
+    "enabled": true
+  },
+  {
+    "id": "openai-api",
+    "title": "OpenAI API docs",
+    "service": "openai",
+    "url": "https://developers.openai.com/api/docs/",
+    "allowed_domains": [
+      "developers.openai.com"
+    ],
+    "max_pages": 5,
+    "enabled": true
+  },
+  {
+    "id": "anthropic-api",
+    "title": "Anthropic API docs",
+    "service": "anthropic",
+    "url": "https://docs.anthropic.com/",
+    "allowed_domains": [
+      "docs.anthropic.com"
+    ],
+    "max_pages": 5,
+    "enabled": true
+  },
+  {
+    "id": "gmail-api-guide",
+    "title": "Official Gmail API Guide",
+    "service": "gmail",
+    "url": "https://developers.google.com/workspace/gmail/api/guides",
+    "allowed_domains": [
+      "developers.google.com"
+    ],
+    "max_pages": 1,
+    "enabled": true
+  },
+  {
+    "id": "google-forms-trigger-events",
+    "title": "Official Google Forms Trigger Events",
+    "service": "google-forms",
+    "url": "https://developers.google.com/apps-script/guides/triggers/events",
+    "allowed_domains": [
+      "developers.google.com"
+    ],
+    "max_pages": 1,
+    "enabled": true
+  },
+  {
+    "id": "google-forms-trigger-builder",
+    "title": "Official Google Forms Trigger Builder",
+    "service": "google-forms",
+    "url": "https://developers.google.com/apps-script/reference/script/form-trigger-builder",
+    "allowed_domains": [
+      "developers.google.com"
+    ],
+    "max_pages": 1,
+    "enabled": true
+  }
+]
