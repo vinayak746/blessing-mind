@@ -37,7 +37,7 @@ CASES = [
     {
         "name": "Google Forms trigger",
         "query": "How does the Google Forms trigger node work?",
-        "expected": ("nodes-google-form-trigger.md",),
+        "expected": ("nodes-google-form-trigger.md", "google-form.md"),
     },
     {
         "name": "Authentication methods",

@@ -1,7 +1,9 @@
 import os
+import time
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors
 from google.genai import types
 
 load_dotenv()
@@ -10,6 +12,30 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 client = genai.Client(api_key=API_KEY) if API_KEY else None
+
+
+class GeminiUnavailableError(Exception):
+    """Raised when Gemini remains temporarily unavailable after retries."""
+
+
+def generate_with_retry(**kwargs):
+    """Retry temporary Gemini API failures, with bounded exponential backoff."""
+    for attempt in range(3):
+        try:
+            return client.models.generate_content(**kwargs)
+        except errors.APIError as exc:
+            status = getattr(exc, "code", None)
+
+            if status not in (429, 500, 502, 503, 504):
+                raise
+
+            if attempt == 2:
+                raise GeminiUnavailableError(
+                    "Gemini remained unavailable after 3 attempts."
+                ) from exc
+
+            time.sleep(2 ** (attempt + 1))
+
 
 
 def analyze_image(
@@ -41,7 +67,7 @@ Rules:
 - Return a concise description useful for searching Blessing documentation.
 """
 
-    response = client.models.generate_content(
+    response = generate_with_retry(
         model=MODEL,
         contents=[
             prompt,
@@ -55,7 +81,132 @@ Rules:
     if not response.text:
         raise RuntimeError("Gemini returned an empty image analysis.")
 
-    return response.text.strip()
+    answer = response.text.strip()
+    return answer
+
+
+
+def ensure_documented_expressions(
+    question: str,
+    evidence: str,
+    answer: str,
+) -> str:
+    """Add explicitly requested, documented expressions with valid citations."""
+    import re
+
+    if not re.search(
+        r"\b(exact|complete|downstream|documented)\b.*\b(expression|handlebars)\b"
+        r"|\b(expression|handlebars)\b.*\b(exact|complete|downstream|documented)\b",
+        question,
+        re.IGNORECASE,
+    ):
+        return answer
+
+    variable_names = set(
+        re.findall(
+            r"\bvariable name(?:\s+is|\s*:)?\s+`?([A-Za-z_]\w*)",
+            question,
+            re.IGNORECASE,
+        )
+    )
+
+    if not variable_names:
+        return answer
+
+    gmail_match = re.search(
+        r"Gmail Reader(?:'s)?\s+Variable Name"
+        r"(?:\s+is|\s*:)?\s+`?([A-Za-z_]\w*)",
+        question,
+        re.IGNORECASE,
+    )
+    gmail_variable = gmail_match.group(1) if gmail_match else None
+
+    documented = {}
+
+    passages = re.split(r"(?=\[S\d+\]\s+Source:)", evidence)
+
+    for passage in passages:
+        citation_match = re.match(r"(\[S\d+\])\s+Source:", passage)
+        if not citation_match:
+            continue
+
+        citation = citation_match.group(1)
+
+        # Implementation notes may mention outdated UI hints or
+        # incorrect expressions. Only extract expressions documented
+        # as actual workflow inputs or outputs.
+        authoritative_passage = re.split(
+            r"\*\*Implementation note:\*\*",
+            passage,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+
+        expression_pattern = (
+            r"\{\{\s*(?:json\s+)?"
+            r"([A-Za-z_]\w*|\$\{watchVariableName\})"
+            r"\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\}\}"
+        )
+
+        for match in re.finditer(expression_pattern, authoritative_passage):
+            variable = match.group(1)
+            property_path = match.group(2)
+
+            if variable == "${watchVariableName}":
+                matching_variables = (
+                    {gmail_variable} if gmail_variable else set()
+                )
+            elif variable in variable_names:
+                matching_variables = {variable}
+            else:
+                continue
+
+            for actual_variable in matching_variables:
+                helper = "json " if re.search(
+                    r"\{\{\s*json\s+",
+                    match.group(0),
+                ) else ""
+
+                expression = (
+                    f"{{{{{helper}{actual_variable}.{property_path}}}}}"
+                )
+
+                documented.setdefault(
+                    expression,
+                    {
+                        "citation": citation,
+                        "property": property_path.split(".")[-1],
+                    },
+                )
+
+    additions = []
+
+    for expression, details in documented.items():
+        property_name = details["property"]
+        citation = details["citation"]
+
+        expression_missing = expression not in answer
+        property_missing = (
+            re.search(rf"\b{re.escape(property_name)}\b", answer) is None
+        )
+
+        if not expression_missing and not property_missing:
+            continue
+
+        if re.search(r"\bproperty\b|\boutput\b", question, re.IGNORECASE):
+            additions.append(
+                f"- The documented output property is `{property_name}`; "
+                f"reference it downstream as `{expression}` {citation}."
+            )
+        else:
+            additions.append(
+                f"- The documented expression is `{expression}` {citation}."
+            )
+
+    if not additions:
+        return answer
+
+    return answer.rstrip() + "\n\nDocumented details:\n" + "\n".join(additions)
 
 
 def generate_answer(
@@ -143,6 +294,37 @@ EXPRESSION ACCURACY RULES:
 - Do not substitute dot notation for bracket notation, or vice versa, when the documentation provides a specific expression.
 - For the Google Form Trigger, when supported by the evidence, use `{{{{googleForm.responses['Question Name']}}}}` to reference a submitted answer.
 - If the exact expression is unavailable in the evidence, say so instead of guessing.
+- When a question asks about both a node's input and its output,
+  explicitly provide both documented expressions or properties.
+- For multi-node workflows, distinguish the upstream expression
+  used to consume a previous node's output from the current node's
+  output property used by downstream nodes.
+- If the evidence documents an exact downstream expression,
+  reproduce it explicitly, even if the output JSON example already
+  shows the corresponding property.
+- When the user explicitly asks for an exact expression, reproduce
+  the complete expression character-for-character from the evidence,
+  including all opening and closing Handlebars braces.
+- Never replace a documented expression with a plain property path.
+  For example, `{{{{mySlack.messageContent}}}}` must not be shortened
+  to `mySlack.messageContent`.
+- Put exact workflow expressions in inline code formatting so users
+  can copy them without ambiguity.
+MULTI-NODE WORKFLOW ANSWERING:
+- When a question involves two or more connected nodes, identify each
+  node's role in the requested data flow.
+- For every connection, explicitly state the upstream expression
+  that the downstream node should use.
+- If the question asks about the receiving node's output, explicitly
+  state the documented output property and its complete downstream
+  Handlebars expression when the evidence provides them.
+- Treat each requested expression, property, and output shape as a
+  separate requirement. Do not consider the answer complete merely
+  because the upstream connection is explained.
+- Before answering, check that every requested detail appears in
+  your response and is supported by the supplied evidence.
+- If one detail cannot be verified, say exactly which detail is
+  unavailable while still answering the other confirmed parts.
 
 EXAMPLE REPRODUCTION RULES:
 - If the user asks for an example and the supplied evidence contains one, include that example in the answer.
@@ -181,7 +363,7 @@ KNOWLEDGE-BASE EVIDENCE:
 Write the most useful concise answer for the user's actual goal.
 """
 
-    response = client.models.generate_content(
+    response = generate_with_retry(
         model=MODEL,
         contents=prompt,
     )
@@ -189,4 +371,4 @@ Write the most useful concise answer for the user's actual goal.
     if not response.text:
         raise RuntimeError("Gemini returned an empty response.")
 
-    return response.text.strip()
+    return ensure_documented_expressions(question, evidence, response.text.strip())

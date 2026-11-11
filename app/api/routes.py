@@ -4,7 +4,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.services.retrieval import retrieve
-from app.services.generation import analyze_image, generate_answer
+from app.services.generation import GeminiUnavailableError, analyze_image, generate_answer
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -97,10 +97,7 @@ def build_sources(matches: list[dict]) -> list[Source]:
             chunk_text = (chunk.get("text") or "").strip()
             if chunk_text and chunk_text not in seen_text:
                 seen_text.add(chunk_text)
-                excerpts.append(
-                    f"[Chunk {chunk.get('chunk_index', 'unknown')}] "
-                    f"{chunk_text[:1200]}"
-                )
+                excerpts.append(chunk_text[:1200])
 
         sources.append(
             Source(
@@ -179,16 +176,54 @@ def retrieve_image_evidence(
     return results[:top_k]
 
 def make_evidence(matches: list[dict]) -> str:
-    """Keep every evidence chunk while sharing IDs for the same source."""
+    """Organize evidence by source and prioritize node-focused passages."""
     source_ids = build_source_ids(matches)
+    grouped = {}
+    source_order = []
 
-    return "\n\n".join(
-        f"[{source_ids[source_identity(match)]}] "
-        f"Source: {match.get('source', 'unknown')} "
-        f"(chunk {match.get('chunk_index', 'unknown')})\n"
-        f"{match.get('text', '')[:2500]}"
-        for match in matches
-    )
+    for match in matches:
+        identity = source_identity(match)
+
+        if identity not in grouped:
+            grouped[identity] = []
+            source_order.append(identity)
+
+        grouped[identity].append(match)
+
+    sections = []
+
+    for identity in source_order:
+        chunks = grouped[identity]
+        chunks.sort(
+            key=lambda item: bool(
+                item.get("focused_for_nodes") or item.get("focused_for_node")
+            ),
+            reverse=True,
+        )
+
+        source_sections = []
+
+        for match in chunks:
+            focused_nodes = match.get("focused_for_nodes") or []
+            if not focused_nodes and match.get("focused_for_node"):
+                focused_nodes = [match["focused_for_node"]]
+
+            focus_label = (
+                " | Retrieved specifically for: " + ", ".join(focused_nodes)
+                if focused_nodes else ""
+            )
+
+            source_sections.append(
+                f"[{source_ids[identity]}] "
+                f"Source: {match.get('source', 'unknown')} "
+                f"(chunk {match.get('chunk_index', 'unknown')})"
+                f"{focus_label}\n"
+                f"{match.get('text', '')[:2500]}"
+            )
+
+        sections.append("\n\n".join(source_sections))
+
+    return "\n\n".join(sections)
 
 
 def no_evidence_response(
@@ -297,7 +332,14 @@ def health():
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
-    matches = retrieve(request.message, top_k=8)
+    try:
+        matches = retrieve(request.message, top_k=10)
+    except RuntimeError:
+        logger.exception("Knowledge database retrieval failed")
+        raise HTTPException(
+            status_code=503,
+            detail="The knowledge database is temporarily unavailable. Please retry shortly.",
+        )
 
     if not matches:
         return no_evidence_response()
@@ -307,10 +349,16 @@ def chat(request: ChatRequest):
             request.message,
             make_evidence(matches),
         )
+    except GeminiUnavailableError:
+        logger.exception("Gemini is temporarily unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="The AI model is temporarily unavailable. Please retry shortly.",
+        )
     except Exception:
         logger.exception("Answer generation failed")
         raise HTTPException(
-            status_code=502,
+            status_code=500,
             detail="The AI answer could not be generated. Check service logs.",
         )
 
@@ -381,6 +429,12 @@ async def chat_with_image(
             image_bytes,
             mime_type,
         )
+    except GeminiUnavailableError:
+        logger.exception("Gemini is temporarily unavailable during image analysis")
+        raise HTTPException(
+            status_code=503,
+            detail="The AI model is temporarily unavailable. Please retry shortly.",
+        )
     except Exception:
         logger.exception("Image analysis failed")
         raise HTTPException(
@@ -390,11 +444,19 @@ async def chat_with_image(
 
     # Use visual context to improve retrieval for vague questions such
     # as "What is wrong here?" or "How do I fix this error?"
-    matches = retrieve_image_evidence(
-    	message=message,
-    	visual_context=visual_context,
-    	top_k=5,
-    )
+    try:
+        matches = retrieve_image_evidence(
+            message=message,
+            visual_context=visual_context,
+            top_k=5,
+        )
+    except RuntimeError:
+        logger.exception("Image knowledge retrieval failed")
+        raise HTTPException(
+            status_code=503,
+            detail="The knowledge database is temporarily unavailable. Please retry shortly.",
+        )
+
     if not matches:
         return no_evidence_response(visual_context)
 
@@ -403,6 +465,12 @@ async def chat_with_image(
             message,
             make_evidence(matches),
             visual_context=visual_context,
+        )
+    except GeminiUnavailableError:
+        logger.exception("Gemini is temporarily unavailable during image answer generation")
+        raise HTTPException(
+            status_code=503,
+            detail="The AI model is temporarily unavailable. Please retry shortly.",
         )
     except Exception:
         logger.exception("Image-based answer generation failed")

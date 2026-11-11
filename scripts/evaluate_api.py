@@ -75,7 +75,8 @@ TESTS = [
             "and does the Manual Trigger require configuration?"
         ),
         "required": [
-            "execute workflow",
+            "Execute",
+            "configuration",
         ],
         "source": "manual-trigger.md",
     },
@@ -102,7 +103,7 @@ TESTS = [
             "messageContent",
         ],
         "expected_sources": [
-            "nodes-gemini.md",
+            "gemini.md",
             "slack.md",
         ],
     },
@@ -123,7 +124,7 @@ TESTS = [
         ],
         "expected_sources": [
             "nodes-gmail-reader.md",
-            "nodes-gemini.md",
+            "gemini.md",
         ],
     },
     {

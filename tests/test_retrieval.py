@@ -191,3 +191,117 @@ def test_source_authority_does_not_change_relevance_scores():
     ranked_scores = {item["id"]: item["rerank_score"] for item in ranked}
 
     assert ranked_scores == original_scores
+
+def test_multi_query_fusion_combines_ranks_and_node_focus():
+    import app.services.retrieval as service
+
+    first = [
+        {"id": "shared", "text": "Shared chunk"},
+        {"id": "gemini", "text": "Gemini documentation"},
+    ]
+    second = [
+        {"id": "shared", "text": "Shared chunk"},
+        {"id": "slack", "text": "Slack documentation"},
+    ]
+
+    result = service.fuse_multi_query_rankings(
+        [first, second],
+        [2.0, 1.0],
+        [None, "slack"],
+    )
+
+    shared = next(item for item in result if item["id"] == "shared")
+    assert shared["focused_for_nodes"] == ["slack"]
+    assert shared["focused_for_node"] == "slack"
+
+    assert result[0]["id"] == "shared"
+
+
+def test_multi_query_fusion_preserves_multiple_node_associations():
+    import app.services.retrieval as service
+
+    result = service.fuse_multi_query_rankings(
+        [
+            [{"id": "shared", "text": "Shared chunk"}],
+            [{"id": "shared", "text": "Shared chunk"}],
+        ],
+        [2.0, 1.0],
+        ["gemini", "slack"],
+    )
+
+    assert len(result) == 1
+    assert result[0]["focused_for_nodes"] == ["gemini", "slack"]
+    assert result[0]["focused_for_node"] == "gemini"
+
+
+def test_multi_node_retrieve_uses_weighted_rank_fusion(monkeypatch):
+    import app.services.retrieval as service
+
+    calls = []
+
+    def fake_retrieve(query, top_k=5, apply_authority=True):
+        calls.append((query, top_k, apply_authority))
+
+        if query == "Gemini and Slack workflow":
+            return [
+                {"id": "shared", "text": "Combined result"},
+                {"id": "other", "text": "Other result"},
+            ]
+
+        if "gemini node configuration" in query.lower():
+            return [
+                {"id": "shared", "text": "Combined result"},
+                {"id": "gemini", "text": "Gemini result"},
+            ]
+
+        if "slack node configuration" in query.lower():
+            return [
+                {"id": "shared", "text": "Combined result"},
+                {"id": "slack", "text": "Slack result"},
+            ]
+
+        return []
+
+    monkeypatch.setattr(
+        service,
+        "_mentioned_known_nodes",
+        lambda query: [("gemini", "gemini"), ("slack", "slack")],
+    )
+    monkeypatch.setattr(service, "_retrieve_single_query", fake_retrieve)
+    monkeypatch.setattr(service, "RERANKER_ENABLED", False)
+    monkeypatch.setattr(
+        service,
+        "rank_by_source_authority",
+        lambda query, candidates: candidates,
+    )
+
+    result = service.retrieve("Gemini and Slack workflow", top_k=5)
+
+    assert {item["id"] for item in result} == {
+        "shared", "other", "gemini", "slack"
+    }
+
+    shared = next(item for item in result if item["id"] == "shared")
+    assert shared["focused_for_nodes"] == ["gemini", "slack"]
+    assert shared["focused_for_node"] == "gemini"
+
+    assert calls[0] == ("Gemini and Slack workflow", 8, False)
+    assert all(call[2] is False for call in calls)
+
+
+def test_single_node_retrieve_keeps_existing_path(monkeypatch):
+    import app.services.retrieval as service
+
+    expected = [{"id": "single"}]
+    monkeypatch.setattr(
+        service,
+        "_mentioned_known_nodes",
+        lambda query: [("gemini", "gemini")],
+    )
+    monkeypatch.setattr(
+        service,
+        "_retrieve_single_query",
+        lambda query, top_k=5: expected,
+    )
+
+    assert service.retrieve("Gemini setup", top_k=3) == expected

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import chromadb
 from rank_bm25 import BM25Okapi
-
+from app.services.knowledge_store import ensure_knowledge_collection
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CHROMA_DIR = PROJECT_ROOT / "data" / "chroma"
 COLLECTION_NAME = "blessing_knowledge"
@@ -15,6 +15,11 @@ COLLECTION_NAME = "blessing_knowledge"
 VECTOR_CANDIDATES = 10
 BM25_CANDIDATES = 10
 RRF_K = 60
+
+RERANKER_ENABLED = os.getenv(
+    "RETRIEVAL_RERANKER_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 RERANKER_MODEL = os.getenv(
     "RERANKER_MODEL",
@@ -118,6 +123,75 @@ def get_known_nodes(metadatas: list[dict]) -> set[str]:
     return nodes
 
 
+@lru_cache(maxsize=1)
+def get_retrieval_store():
+    """Cache Chroma data and the BM25 index for this process."""
+
+    export_file = (
+        PROJECT_ROOT
+        / "data"
+        / "exports"
+        / "blessing_knowledge.jsonl.gz"
+    )
+
+    try:
+        client, collection = ensure_knowledge_collection(
+            chroma_dir=CHROMA_DIR,
+            collection_name=COLLECTION_NAME,
+            export_file=export_file,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Could not initialize the knowledge database."
+        )
+        raise RuntimeError(
+            "The Blessing knowledge database could not be initialized."
+        ) from exc
+
+    stored = collection.get(
+        include=["documents", "metadatas"],
+    )
+
+    documents = stored["documents"] or []
+    metadatas = stored["metadatas"] or []
+    ids = stored["ids"]
+
+    if not documents:
+        raise RuntimeError(
+            "The Blessing knowledge database contains no documents."
+        )
+
+    tokenized_documents = [
+        tokenize(document)
+        for document in documents
+    ]
+
+    bm25 = BM25Okapi(tokenized_documents)
+    known_nodes = get_known_nodes(metadatas)
+
+    logger.info(
+        "Retrieval store initialized: %d documents",
+        len(documents),
+    )
+
+    return (
+        client,
+        collection,
+        documents,
+        metadatas,
+        ids,
+        tokenized_documents,
+        bm25,
+        known_nodes,
+    )
+
+def clear_retrieval_cache():
+    """Clear cached data after rebuilding the knowledge index."""
+    get_retrieval_store.cache_clear()
+    logger.info("Retrieval store cache cleared")
+
+
 def reciprocal_rank_fusion(
     ranked_lists: list[list[dict]],
     k: int = RRF_K,
@@ -202,6 +276,12 @@ def rerank_with_relevance_gate(
     """Rerank evidence and reject it if scoring fails or relevance is weak."""
     if not candidates or top_k <= 0:
         return []
+
+    if not RERANKER_ENABLED:
+        logger.info(
+            "CrossEncoder disabled; using fused retrieval ranking."
+        )
+        return candidates[:top_k]
 
     try:
         reranked = rerank(query, candidates)
@@ -324,7 +404,7 @@ def rank_by_source_authority(
     query: str,
     candidates: list[dict],
 ) -> list[dict]:
-    """Adjust ordering by source category without altering relevance scores."""
+    """Adjust ordering by source category without overriding relevance."""
     ranked = []
 
     for candidate in candidates:
@@ -333,57 +413,64 @@ def rank_by_source_authority(
             query,
             result,
         )
-        result["final_rank_score"] = (
-            float(result.get("rerank_score", 0.0))
-            + result["authority_bonus"]
-        )
+
+        if RERANKER_ENABLED:
+            result["final_rank_score"] = (
+                float(result.get("rerank_score", 0.0))
+                + result["authority_bonus"]
+            )
+        else:
+            result["final_rank_score"] = float(
+                result.get("rrf_score", 0.0)
+            )
+
         ranked.append(result)
+
+    if RERANKER_ENABLED:
+        return sorted(
+            ranked,
+            key=lambda item: item["final_rank_score"],
+            reverse=True,
+        )
 
     return sorted(
         ranked,
-        key=lambda item: item["final_rank_score"],
+        key=lambda item: (
+            item["final_rank_score"],
+            item["authority_bonus"],
+        ),
         reverse=True,
     )
 
-
-def _retrieve_single_query(query: str, top_k: int = 5) -> list[dict]:
+def _retrieve_single_query(
+    query: str,
+    top_k: int = 5,
+    apply_authority: bool = True,
+) -> list[dict]:
     """Retrieve, validate, merge, rerank, and authority-rank evidence."""
     if not query.strip() or top_k <= 0:
         return []
 
-    if not CHROMA_DIR.exists():
+    store = get_retrieval_store()
+
+    if store is None:
         return []
 
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-
-    try:
-        collection = client.get_collection(COLLECTION_NAME)
-    except Exception:
-        logger.exception("Could not open Chroma collection")
-        return []
-
-    if collection.count() == 0:
-        return []
-
-    # Load indexed documents for inventory validation and BM25.
-    stored = collection.get(
-        include=["documents", "metadatas"],
-    )
-
-    documents = stored["documents"] or []
-    metadatas = stored["metadatas"] or []
-    ids = stored["ids"]
-
-    if not documents:
-        return []
+    (
+        _client,
+        collection,
+        documents,
+        metadatas,
+        ids,
+        tokenized_documents,
+        bm25,
+        known_nodes,
+    ) = store
 
     # Reject explicitly requested node names absent from the inventory.
     requested_node = extract_requested_node(query)
 
-    if requested_node:
-        known_nodes = get_known_nodes(metadatas)
-
-        if requested_node not in known_nodes:
+    if requested_node and requested_node not in known_nodes:
             logger.info(
                 "Rejected unknown node request: %s",
                 requested_node,
@@ -436,12 +523,6 @@ def _retrieve_single_query(query: str, top_k: int = 5) -> list[dict]:
     if not query_tokens:
         candidates = vector_ranked
     else:
-        tokenized_documents = [
-            tokenize(document)
-            for document in documents
-        ]
-
-        bm25 = BM25Okapi(tokenized_documents)
         scores = bm25.get_scores(query_tokens)
         unique_query_tokens = set(query_tokens)
 
@@ -506,24 +587,20 @@ def _retrieve_single_query(query: str, top_k: int = 5) -> list[dict]:
         return []
 
     # 5. Query-aware source-authority ranking.
-    ranked = rank_by_source_authority(query, reranked)
+    if not apply_authority:
+        return reranked[:top_k]
 
+    ranked = rank_by_source_authority(query, reranked)
     return ranked[:top_k]
 
 def _mentioned_known_nodes(query: str) -> list[tuple[str, str]]:
     """Find known node names explicitly mentioned in a query."""
-    if not CHROMA_DIR.exists():
+    store = get_retrieval_store()
+
+    if store is None:
         return []
 
-    try:
-        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        collection = client.get_collection(COLLECTION_NAME)
-        stored = collection.get(include=["metadatas"])
-    except Exception:
-        logger.exception("Could not load node inventory")
-        return []
-
-    known_nodes = sorted(get_known_nodes(stored.get("metadatas") or []))
+    known_nodes = sorted(store[7])
     query_lower = query.lower()
     found = []
 
@@ -562,6 +639,49 @@ def _focused_node_query(node_label: str) -> str:
     )
 
 
+def fuse_multi_query_rankings(
+    ranked_lists: list[list[dict]],
+    weights: list[float],
+    focused_nodes: list[str | None],
+    k: int = RRF_K,
+) -> list[dict]:
+    """Fuse independently ranked query results using weighted RRF."""
+    fused = {}
+
+    for ranked_list, weight, focused_node in zip(
+        ranked_lists,
+        weights,
+        focused_nodes,
+    ):
+        for rank, item in enumerate(ranked_list, start=1):
+            key = item["id"]
+
+            if key not in fused:
+                fused[key] = {
+                    **item,
+                    "rrf_score": 0.0,
+                    "focused_for_nodes": [],
+                }
+
+            result = fused[key]
+            result["rrf_score"] += float(weight) / (k + rank)
+
+            if focused_node and focused_node not in result["focused_for_nodes"]:
+                result["focused_for_nodes"].append(focused_node)
+
+    results = list(fused.values())
+
+    for item in results:
+        nodes = item["focused_for_nodes"]
+        item["focused_for_node"] = nodes[0] if nodes else ""
+
+    return sorted(
+        results,
+        key=lambda item: item["rrf_score"],
+        reverse=True,
+    )
+
+
 def retrieve(query: str, top_k: int = 5) -> list[dict]:
     """Retrieve evidence for single-node and multi-node questions."""
     if not query.strip() or top_k <= 0:
@@ -572,31 +692,56 @@ def retrieve(query: str, top_k: int = 5) -> list[dict]:
     if len(nodes) < 2:
         return _retrieve_single_query(query, top_k)
 
-    merged = {}
+    ranked_lists = []
+    weights = []
+    focused_nodes = []
 
-    # First try the complete user query.
-    for item in _retrieve_single_query(query, top_k=max(top_k, 8)):
-        merged[item["id"]] = dict(item)
+    # The original question receives extra weight because it captures
+    # the user's complete intent.
+    original_results = _retrieve_single_query(
+        query,
+        top_k=max(top_k, 8),
+        apply_authority=False,
+    )
+
+    if original_results:
+        ranked_lists.append(original_results)
+        weights.append(2.0)
+        focused_nodes.append(None)
 
     # Retrieve each explicitly mentioned node independently.
     for slug, label in nodes:
         focused_query = _focused_node_query(label)
+        focused_results = _retrieve_single_query(
+            focused_query,
+            top_k=5,
+            apply_authority=False,
+        )
 
-        for item in _retrieve_single_query(focused_query, top_k=5):
-            candidate = dict(item)
-            candidate["focused_for_node"] = slug
-            merged.setdefault(candidate["id"], candidate)
+        if focused_results:
+            ranked_lists.append(focused_results)
+            weights.append(1.0)
+            focused_nodes.append(slug)
 
-    if not merged:
+    if not ranked_lists:
         return []
 
-    # Only passages that passed an individual relevance gate are present.
-    # Rank them against the original query, but don't discard them merely
-    # because a multi-fact query scores poorly against individual passages.
-    candidates = list(merged.values())
-    reranked = rerank(query, candidates)
+    candidates = fuse_multi_query_rankings(
+        ranked_lists,
+        weights,
+        focused_nodes,
+    )
+
+    if RERANKER_ENABLED:
+        # Re-score the combined evidence against the complete user query.
+        reranked = rerank(query, candidates)
+    else:
+        # Weighted rank fusion is used instead of comparing raw per-query
+        # RRF scores, which are not comparable across different queries.
+        reranked = candidates
 
     for item in reranked:
-        item["focused_for_node"] = item.get("focused_for_node", "")
+        item.setdefault("focused_for_node", "")
+        item.setdefault("focused_for_nodes", [])
 
     return rank_by_source_authority(query, reranked)[:top_k]

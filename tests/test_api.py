@@ -110,3 +110,20 @@ def test_duplicate_urls_share_citation_and_return_one_source():
     assert "[S1] Source: external/stripe.md (chunk 2)" in evidence
     assert "[S2] Source: guides/stripe-node.md (chunk 0)" in evidence
     assert sources[0].url == "https://docs.stripe.com/webhooks"
+
+
+def test_chat_returns_503_when_knowledge_store_fails(monkeypatch):
+    import app.api.routes as routes
+
+    def fail_retrieval(*args, **kwargs):
+        raise RuntimeError("Knowledge database unavailable")
+
+    monkeypatch.setattr(routes, "retrieve", fail_retrieval)
+
+    response = client.post(
+        "/v1/chat",
+        json={"message": "How do I configure Discord?"},
+    )
+
+    assert response.status_code == 503
+    assert "knowledge database" in response.json()["detail"].lower()

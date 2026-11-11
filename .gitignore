@@ -39,3 +39,4 @@ data/*chroma*backup*/
 # Timestamped and named backup files
 *.bak-*
 *.backup-*
+data/restore_test/
