@@ -1,10 +1,22 @@
 import logging
+import os
+import hmac
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from dotenv import load_dotenv
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Header, Depends
+
 from pydantic import BaseModel, Field
 
 from app.services.retrieval import retrieve
-from app.services.generation import GeminiUnavailableError, analyze_image, generate_answer
+from app.services.generation import analyze_image, generate_answer
+from app.services.providers import (
+    ProviderConfigurationError,
+    ProviderRequestError,
+    ProviderUnavailableError,
+    resolve_model,
+)
+
+load_dotenv()
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -19,6 +31,8 @@ ALLOWED_IMAGE_TYPES = {
 
 
 class ChatRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=40)
+    model: str = Field(min_length=1, max_length=120)
     conversation_id: str | None = None
     message: str = Field(min_length=1, max_length=12000)
     context: dict | None = None
@@ -40,6 +54,97 @@ class ChatResponse(BaseModel):
     retrieval_configured: bool = False
 
 
+
+
+
+def get_provider_credentials(
+    authorization: str | None = Header(default=None),
+    provider_api_key: str | None = Header(
+        default=None,
+        alias="X-Provider-API-Key",
+    ),
+) -> str:
+    """Authenticate Blessing and obtain the user's request-scoped API key."""
+    expected_token = os.getenv("BLESSING_SERVICE_TOKEN")
+
+    if not expected_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Service authentication is not configured.",
+        )
+
+    if not authorization or authorization[:7].lower() != "bearer ":
+        raise HTTPException(
+            status_code=401,
+            detail="Valid service authentication is required.",
+        )
+
+    supplied_token = authorization[7:].strip()
+
+    if not hmac.compare_digest(
+        supplied_token.encode("utf-8"),
+        expected_token.encode("utf-8"),
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid service authentication.",
+        )
+
+    if not provider_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="A provider API key is required.",
+        )
+
+    if (
+        len(provider_api_key) > 4096
+        or any(ord(char) < 32 or ord(char) == 127 for char in provider_api_key)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid provider API key format.",
+        )
+
+    provider_api_key = provider_api_key.strip()
+
+    if not provider_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="A provider API key is required.",
+        )
+
+    return provider_api_key
+
+
+def validate_provider(provider: str, model: str) -> None:
+    """Reject unsupported provider/model selections before retrieval."""
+    try:
+        resolve_model(provider, model)
+    except ProviderConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+def provider_http_error(exc: Exception) -> HTTPException:
+    """Translate sanitized provider errors into safe HTTP responses."""
+    if isinstance(exc, ProviderConfigurationError):
+        return HTTPException(status_code=400, detail=str(exc))
+
+    if isinstance(exc, ProviderUnavailableError):
+        return HTTPException(
+            status_code=503,
+            detail="The AI provider is temporarily unavailable. Please retry shortly.",
+        )
+
+    if isinstance(exc, ProviderRequestError):
+        return HTTPException(
+            status_code=502,
+            detail="The AI provider rejected or could not process the request. Check your provider key, model and account access.",
+        )
+
+    return HTTPException(
+        status_code=502,
+        detail="The AI request could not be completed.",
+    )
 
 
 def source_identity(match: dict) -> str:
@@ -111,70 +216,6 @@ def build_sources(matches: list[dict]) -> list[Source]:
         )
 
     return sources
-def retrieve_image_evidence(
-    message: str,
-    visual_context: str,
-    top_k: int = 5,
-) -> list[dict]:
-    """Retrieve screenshot evidence with separate, focused queries."""
-    queries = [message.strip()]
-
-    # Search the screenshot observations separately so that a long
-    # description doesn't dilute the user's original question.
-    if visual_context.strip():
-        queries.append(visual_context.strip())
-
-    # Add focused searches for relevant Blessing nodes.
-    context_lower = visual_context.lower()
-
-    node_queries = {
-        "gmail-reader": "How do I configure the Gmail Reader node in Blessing?",
-        "gemini": "How do I configure the Gemini node in Blessing?",
-        "discord": "How do I configure the Discord node message content and template variables?",
-        "slack": "How do I configure Slack message content and workflow variables?",
-        "manual-trigger": "How do I start and execute a workflow using Manual Trigger in Blessing?",
-        "google-form-trigger": "How do I configure the Google Form Trigger node in Blessing?",
-        "stripe-trigger": "How do I configure the Stripe Trigger node in Blessing?",
-        "http-request": "How do I configure the HTTP Request node in Blessing?",
-    }
-
-    for node, query in node_queries.items():
-        if node in context_lower:
-            queries.append(query)
-
-    merged = {}
-    for query in queries:
-        if not query:
-            continue
-
-        for match in retrieve(query, top_k=top_k):
-            # Chunk IDs are stable across retrieval queries.
-            identity = match.get("id") or (
-                match.get("source"),
-                match.get("chunk_index"),
-                match.get("text"),
-            )
-
-            existing = merged.get(identity)
-            if existing is None:
-                merged[identity] = match
-            elif (
-                match.get("final_rank_score", match.get("rerank_score", 0))
-                > existing.get("final_rank_score", existing.get("rerank_score", 0))
-            ):
-                merged[identity] = match
-
-    results = list(merged.values())
-    results.sort(
-        key=lambda item: item.get(
-            "final_rank_score",
-            item.get("rerank_score", float("-inf")),
-        ),
-        reverse=True,
-    )
-
-    return results[:top_k]
-
 def make_evidence(matches: list[dict]) -> str:
     """Organize evidence by source and prioritize node-focused passages."""
     source_ids = build_source_ids(matches)
@@ -331,15 +372,20 @@ def health():
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
+def chat(
+    request: ChatRequest,
+    api_key: str = Depends(get_provider_credentials),
+):
+    validate_provider(request.provider, request.model)
+
     try:
         matches = retrieve(request.message, top_k=10)
     except RuntimeError:
-        logger.exception("Knowledge database retrieval failed")
+        logger.error("Knowledge database retrieval failed (%s)", "RuntimeError")
         raise HTTPException(
             status_code=503,
             detail="The knowledge database is temporarily unavailable. Please retry shortly.",
-        )
+        ) from None
 
     if not matches:
         return no_evidence_response()
@@ -348,19 +394,19 @@ def chat(request: ChatRequest):
         answer = generate_answer(
             request.message,
             make_evidence(matches),
+            provider=request.provider,
+            model=request.model,
+            api_key=api_key,
         )
-    except GeminiUnavailableError:
-        logger.exception("Gemini is temporarily unavailable")
+    except (ProviderConfigurationError, ProviderRequestError, ProviderUnavailableError) as exc:
+        logger.warning("AI provider request failed: %s", type(exc).__name__)
+        raise provider_http_error(exc) from None
+    except Exception as exc:
+        logger.error("Answer generation failed (%s)", type(exc).__name__)
         raise HTTPException(
-            status_code=503,
-            detail="The AI model is temporarily unavailable. Please retry shortly.",
-        )
-    except Exception:
-        logger.exception("Answer generation failed")
-        raise HTTPException(
-            status_code=500,
-            detail="The AI answer could not be generated. Check service logs.",
-        )
+            status_code=502,
+            detail="The AI answer could not be generated.",
+        ) from None
 
     return ChatResponse(
         answer=answer,
@@ -391,9 +437,14 @@ def validate_image_bytes(data: bytes, mime_type: str) -> bool:
 @router.post("/chat/image", response_model=ChatResponse)
 async def chat_with_image(
     message: str = Form(..., min_length=1, max_length=12000),
+    provider: str = Form(..., min_length=1, max_length=40),
+    model: str = Form(..., min_length=1, max_length=120),
     image: UploadFile = File(...),
+    api_key: str = Depends(get_provider_credentials),
 ):
     """Answer a question using an uploaded screenshot and RAG evidence."""
+    validate_provider(provider, model)
+
     mime_type = (image.content_type or "").lower().split(";")[0].strip()
 
     if mime_type not in ALLOWED_IMAGE_TYPES:
@@ -402,14 +453,13 @@ async def chat_with_image(
             detail="Unsupported image type. Upload a JPEG, PNG, or WebP image.",
         )
 
-    image_bytes = await image.read(MAX_IMAGE_BYTES + 1)
-    await image.close()
+    try:
+        image_bytes = await image.read(MAX_IMAGE_BYTES + 1)
+    finally:
+        await image.close()
 
     if not image_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded image is empty.",
-        )
+        raise HTTPException(status_code=400, detail="The uploaded image is empty.")
 
     if len(image_bytes) > MAX_IMAGE_BYTES:
         raise HTTPException(
@@ -428,22 +478,20 @@ async def chat_with_image(
             message,
             image_bytes,
             mime_type,
+            provider=provider,
+            model=model,
+            api_key=api_key,
         )
-    except GeminiUnavailableError:
-        logger.exception("Gemini is temporarily unavailable during image analysis")
-        raise HTTPException(
-            status_code=503,
-            detail="The AI model is temporarily unavailable. Please retry shortly.",
-        )
-    except Exception:
-        logger.exception("Image analysis failed")
+    except (ProviderConfigurationError, ProviderRequestError, ProviderUnavailableError) as exc:
+        logger.warning("Image provider request failed: %s", type(exc).__name__)
+        raise provider_http_error(exc) from None
+    except Exception as exc:
+        logger.error("Image analysis failed (%s)", type(exc).__name__)
         raise HTTPException(
             status_code=502,
-            detail="The image could not be analyzed. Check service logs.",
-        )
+            detail="The image could not be analyzed.",
+        ) from None
 
-    # Use visual context to improve retrieval for vague questions such
-    # as "What is wrong here?" or "How do I fix this error?"
     try:
         matches = retrieve_image_evidence(
             message=message,
@@ -451,11 +499,11 @@ async def chat_with_image(
             top_k=5,
         )
     except RuntimeError:
-        logger.exception("Image knowledge retrieval failed")
+        logger.error("Image knowledge retrieval failed (%s)", "RuntimeError")
         raise HTTPException(
             status_code=503,
             detail="The knowledge database is temporarily unavailable. Please retry shortly.",
-        )
+        ) from None
 
     if not matches:
         return no_evidence_response(visual_context)
@@ -465,19 +513,19 @@ async def chat_with_image(
             message,
             make_evidence(matches),
             visual_context=visual_context,
+            provider=provider,
+            model=model,
+            api_key=api_key,
         )
-    except GeminiUnavailableError:
-        logger.exception("Gemini is temporarily unavailable during image answer generation")
-        raise HTTPException(
-            status_code=503,
-            detail="The AI model is temporarily unavailable. Please retry shortly.",
-        )
-    except Exception:
-        logger.exception("Image-based answer generation failed")
+    except (ProviderConfigurationError, ProviderRequestError, ProviderUnavailableError) as exc:
+        logger.warning("Image answer provider request failed: %s", type(exc).__name__)
+        raise provider_http_error(exc) from None
+    except Exception as exc:
+        logger.error("Image-based answer generation failed (%s)", type(exc).__name__)
         raise HTTPException(
             status_code=502,
-            detail="The AI answer could not be generated. Check service logs.",
-        )
+            detail="The AI answer could not be generated.",
+        ) from None
 
     return ChatResponse(
         answer=answer,
