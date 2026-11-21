@@ -1,9 +1,12 @@
 import base64
+import logging
 import time
 from typing import Any
 
 import litellm
 
+
+logger = logging.getLogger(__name__)
 
 # Provider credentials and prompts must never be written to debug logs.
 litellm.set_verbose = False
@@ -118,17 +121,32 @@ def _completion(
             )
 
             if not content:
-                raise ProviderRequestError("The AI provider returned an empty response.")
+                raise ProviderRequestError(
+                    "The AI provider returned an empty response."
+                )
 
             return content
 
         except ProviderRequestError:
             raise
+
         except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if status is None:
+                status = getattr(exc, "status", None)
+
+            logger.warning(
+                "LiteLLM request failed: exception=%s status=%s attempt=%s",
+                type(exc).__name__,
+                status if isinstance(status, int) else "unknown",
+                attempt + 1,
+            )
+
             if _is_retryable(exc):
                 if attempt < 1:
                     time.sleep(1)
                     continue
+
                 raise ProviderUnavailableError(
                     "The AI provider is temporarily unavailable."
                 ) from None
@@ -137,8 +155,9 @@ def _completion(
                 "The AI provider rejected or could not process the request."
             ) from None
 
-    raise ProviderUnavailableError("The AI provider is temporarily unavailable.")
-
+    raise ProviderUnavailableError(
+        "The AI provider is temporarily unavailable."
+    )
 
 def generate_text(
     *,
