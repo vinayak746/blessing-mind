@@ -10,10 +10,27 @@ def test_health():
     assert response.json()["status"] == "ok"
 
 
-def test_chat_uses_configured_rag():
+def test_chat_uses_configured_rag(monkeypatch):
+    import app.api.routes as routes
+
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+    monkeypatch.setattr(
+        routes,
+        "generate_answer",
+        lambda *args, **kwargs: "Configure the Discord node with your webhook URL.",
+    )
+
     response = client.post(
         "/v1/chat",
-        json={"message": "How do I configure Discord?"},
+        headers={
+            "Authorization": "bEaReR test-service-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        json={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "How do I configure Discord?",
+        },
     )
 
     assert response.status_code == 200
@@ -120,10 +137,335 @@ def test_chat_returns_503_when_knowledge_store_fails(monkeypatch):
 
     monkeypatch.setattr(routes, "retrieve", fail_retrieval)
 
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
     response = client.post(
         "/v1/chat",
-        json={"message": "How do I configure Discord?"},
+        headers={
+            "Authorization": "Bearer test-service-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        json={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "How do I configure Discord?",
+        },
     )
 
     assert response.status_code == 503
     assert "knowledge database" in response.json()["detail"].lower()
+
+
+def test_chat_rejects_missing_service_token(monkeypatch):
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    response = client.post(
+        "/v1/chat",
+        json={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Hello",
+        },
+    )
+
+    assert response.status_code == 401
+
+
+def test_chat_rejects_invalid_service_token(monkeypatch):
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    response = client.post(
+        "/v1/chat",
+        headers={
+            "Authorization": "Bearer incorrect-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        json={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Hello",
+        },
+    )
+
+    assert response.status_code == 401
+
+
+def test_chat_rejects_missing_provider_api_key(monkeypatch):
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    response = client.post(
+        "/v1/chat",
+        headers={"Authorization": "Bearer test-service-token"},
+        json={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Hello",
+        },
+    )
+
+    assert response.status_code == 400
+
+
+
+
+def test_image_chat_rejects_missing_authorization(monkeypatch):
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    response = client.post(
+        "/v1/chat/image",
+        data={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "What is in this image?",
+        },
+        files={"image": ("test.png", b"fake-image", "image/png")},
+    )
+
+    assert response.status_code == 401
+
+
+def test_provider_api_key_is_not_exposed_in_logs_or_response(
+    monkeypatch, caplog
+):
+    import app.api.routes as routes
+    from app.services.providers import ProviderRequestError
+
+    secret = "sensitive-test-provider-key"
+
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+    monkeypatch.setattr(
+        routes,
+        "retrieve",
+        lambda *args, **kwargs: [
+            {
+                "source": "test.md",
+                "text": "Test documentation evidence.",
+                "chunk_index": 0,
+            }
+        ],
+    )
+
+    def fail_generation(*args, **kwargs):
+        raise ProviderRequestError(f"Provider rejected key: {secret}")
+
+    monkeypatch.setattr(routes, "generate_answer", fail_generation)
+
+    response = client.post(
+        "/v1/chat",
+        headers={
+            "Authorization": "Bearer test-service-token",
+            "X-Provider-API-Key": secret,
+        },
+        json={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Test question",
+        },
+    )
+
+    assert response.status_code == 502
+    assert secret not in caplog.text
+    assert secret not in response.text
+
+def test_chat_returns_503_when_service_token_is_not_configured(monkeypatch):
+    monkeypatch.delenv("BLESSING_SERVICE_TOKEN", raising=False)
+
+    response = client.post(
+        "/v1/chat",
+        headers={
+            "Authorization": "Bearer test-service-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        json={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Hello",
+        },
+    )
+
+    assert response.status_code == 503
+
+
+def test_chat_rejects_non_ascii_service_token(monkeypatch):
+    from fastapi import HTTPException
+    from app.api.routes import get_provider_credentials
+
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    try:
+        get_provider_credentials(
+            authorization="Bearer inválid-token",
+            provider_api_key="test-provider-key",
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("Non-ASCII invalid token should be rejected.")
+def test_invalid_service_token_rejects_chat_before_retrieval(
+    monkeypatch,
+):
+    import app.api.routes as routes
+
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    def unexpected_retrieval(*args, **kwargs):
+        raise AssertionError("Retrieval must not run before authentication.")
+
+    monkeypatch.setattr(routes, "retrieve", unexpected_retrieval)
+
+    response = client.post(
+        "/v1/chat",
+        headers={
+            "Authorization": "Bearer wrong-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        json={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Hello",
+        },
+    )
+
+    assert response.status_code == 401
+
+
+def test_image_chat_rejects_invalid_token_before_image_analysis(
+    monkeypatch,
+):
+    import app.api.routes as routes
+
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    def unexpected_analysis(*args, **kwargs):
+        raise AssertionError("Image analysis must not run before authentication.")
+
+    monkeypatch.setattr(routes, "analyze_image", unexpected_analysis)
+
+    response = client.post(
+        "/v1/chat/image",
+        headers={
+            "Authorization": "Bearer wrong-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        data={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "What is in this image?",
+        },
+        files={"image": ("test.png", b"fake-image", "image/png")},
+    )
+
+    assert response.status_code == 401
+
+def test_chat_rejects_unsupported_provider_before_retrieval(monkeypatch):
+    import app.api.routes as routes
+
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    def unexpected_retrieval(*args, **kwargs):
+        raise AssertionError("Retrieval must not run for an invalid provider.")
+
+    monkeypatch.setattr(routes, "retrieve", unexpected_retrieval)
+
+    response = client.post(
+        "/v1/chat",
+        headers={
+            "Authorization": "Bearer test-service-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        json={
+            "provider": "unsupported",
+            "model": "some-model",
+            "message": "Hello",
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_image_chat_rejects_unsupported_mime_type(monkeypatch):
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    response = client.post(
+        "/v1/chat/image",
+        headers={
+            "Authorization": "Bearer test-service-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        data={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Describe this file",
+        },
+        files={"image": ("test.gif", b"GIF89a", "image/gif")},
+    )
+
+    assert response.status_code == 415
+
+
+def test_image_chat_rejects_empty_image(monkeypatch):
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    response = client.post(
+        "/v1/chat/image",
+        headers={
+            "Authorization": "Bearer test-service-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        data={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Describe this image",
+        },
+        files={"image": ("empty.png", b"", "image/png")},
+    )
+
+    assert response.status_code == 400
+
+
+def test_image_chat_rejects_oversized_image(monkeypatch):
+    import app.api.routes as routes
+
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    response = client.post(
+        "/v1/chat/image",
+        headers={
+            "Authorization": "Bearer test-service-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        data={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Describe this image",
+        },
+        files={
+            "image": (
+                "large.png",
+                b"\x89PNG\r\n\x1a\n" + b"x" * routes.MAX_IMAGE_BYTES,
+                "image/png",
+            )
+        },
+    )
+
+    assert response.status_code == 413
+
+
+def test_image_chat_rejects_mismatched_image_signature(monkeypatch):
+    monkeypatch.setenv("BLESSING_SERVICE_TOKEN", "test-service-token")
+
+    response = client.post(
+        "/v1/chat/image",
+        headers={
+            "Authorization": "Bearer test-service-token",
+            "X-Provider-API-Key": "test-provider-key",
+        },
+        data={
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "message": "Describe this image",
+        },
+        files={"image": ("fake.png", b"not-a-real-png", "image/png")},
+    )
+
+    assert response.status_code == 415

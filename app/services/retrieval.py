@@ -18,7 +18,7 @@ RRF_K = 60
 
 RERANKER_ENABLED = os.getenv(
     "RETRIEVAL_RERANKER_ENABLED",
-    "true",
+    "false",
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 RERANKER_MODEL = os.getenv(

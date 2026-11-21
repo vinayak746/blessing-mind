@@ -36,6 +36,7 @@ def test_nonexistent_node_query_is_not_assumed_supported():
 
 def test_reranker_failure_rejects_evidence(monkeypatch):
     import app.services.retrieval as service
+    monkeypatch.setattr(service, "RERANKER_ENABLED", True)
 
     def broken_reranker(query, candidates):
         raise RuntimeError("simulated reranker failure")
@@ -55,6 +56,7 @@ def test_reranker_failure_rejects_evidence(monkeypatch):
 
 def test_weak_reranker_score_rejects_evidence(monkeypatch):
     import app.services.retrieval as service
+    monkeypatch.setattr(service, "RERANKER_ENABLED", True)
 
     monkeypatch.setattr(service, "MIN_RERANK_SCORE", 0.0)
     monkeypatch.setattr(
@@ -76,6 +78,7 @@ def test_weak_reranker_score_rejects_evidence(monkeypatch):
 
 def test_relevant_reranked_evidence_is_preserved(monkeypatch):
     import app.services.retrieval as service
+    monkeypatch.setattr(service, "RERANKER_ENABLED", True)
 
     monkeypatch.setattr(service, "MIN_RERANK_SCORE", 0.0)
     monkeypatch.setattr(
