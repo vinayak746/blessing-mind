@@ -44,38 +44,44 @@ def test_resolve_model_rejects_invalid_model(model):
         providers.resolve_model("gemini", model)
 
 
-def test_api_key_is_passed_only_to_current_litellm_call(monkeypatch):
+def test_gemini_api_key_is_passed_only_to_current_sdk_client(monkeypatch):
     captured = {}
 
-    def fake_completion(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content="Generated answer")
-                )
-            ]
-        )
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            captured["model"] = kwargs["model"]
+            captured["contents"] = kwargs["contents"]
+            return SimpleNamespace(text="Generated answer")
 
-    monkeypatch.setattr(providers.litellm, "completion", fake_completion)
+    class FakeClient:
+        def __init__(self, *, api_key, http_options):
+            captured["api_key"] = api_key
+            captured["http_options"] = http_options
+            self.models = FakeModels()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(providers.genai, "Client", FakeClient)
 
     secret = "test-provider-secret"
     result = providers.generate_text(
         provider="gemini",
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash-lite",
         api_key=secret,
         prompt="Hello",
     )
 
     assert result == "Generated answer"
     assert captured["api_key"] == secret
-    assert captured["model"] == "gemini/gemini-2.5-flash"
-    assert captured["messages"] == [{"role": "user", "content": "Hello"}]
-    assert captured["timeout"] == 30
-    assert captured["num_retries"] == 0
+    assert captured["model"] == "gemini-3.5-flash-lite"
+    assert captured["contents"] == "Hello"
+    assert captured["http_options"].timeout == 30000
     assert not hasattr(providers, "api_key")
     assert not hasattr(providers, "API_KEY")
-
 
 def test_provider_error_does_not_expose_api_key(monkeypatch):
     secret = "test-provider-secret"
@@ -87,7 +93,7 @@ def test_provider_error_does_not_expose_api_key(monkeypatch):
 
     with pytest.raises(providers.ProviderRequestError) as exc_info:
         providers.generate_text(
-            provider="gemini",
+            provider="openai",
             model="gemini-2.5-flash",
             api_key=secret,
             prompt="Hello",
@@ -127,7 +133,7 @@ def test_retryable_provider_error_retries_then_succeeds(monkeypatch):
     monkeypatch.setattr(providers.time, "sleep", sleeps.append)
 
     result = providers.generate_text(
-        provider="gemini",
+        provider="openai",
         model="gemini-2.5-flash",
         api_key="test-provider-key",
         prompt="Hello",
@@ -150,7 +156,7 @@ def test_retryable_provider_error_returns_safe_unavailable_error(monkeypatch):
 
     with pytest.raises(providers.ProviderUnavailableError) as exc_info:
         providers.generate_text(
-            provider="gemini",
+            provider="openai",
             model="gemini-2.5-flash",
             api_key="test-provider-key",
             prompt="Hello",
@@ -231,7 +237,7 @@ def test_malformed_provider_response_returns_safe_error(monkeypatch, response):
 
     with pytest.raises(providers.ProviderRequestError):
         providers.generate_text(
-            provider="gemini",
+            provider="openai",
             model="gemini-2.5-flash",
             api_key="test-provider-key",
             prompt="Hello",
@@ -248,7 +254,7 @@ def test_non_retryable_provider_error_is_not_retried(monkeypatch):
 
     with pytest.raises(providers.ProviderRequestError):
         providers.generate_text(
-            provider="gemini",
+            provider="openai",
             model="gemini-2.5-flash",
             api_key="test-provider-key",
             prompt="Hello",
